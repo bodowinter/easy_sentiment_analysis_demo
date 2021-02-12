@@ -1,0 +1,241 @@
+---
+title: "Sentiment Analysis Demo"
+author: "Bodo Winter"
+date: "6/6/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preliminaries:
+
+Let's load in packages and data:
+
+```{r cars}
+library(tidyverse)
+library(tidytext)
+library(sentimentr)
+library(broom)
+library(wordcloud)
+yelp <- read_csv('yelp_review_subset.csv')
+yelp
+```
+
+Let's get rid of variables that we are not interested in for now:
+
+```{r}
+yelp <- select(yelp, -user_id, -business_id, -date,
+                -useful, -funny, -cool)
+yelp
+```
+
+Using the tidytext workflow, let's tokenize all the texts, but keeping the review_id and stars as index information:
+
+```{r}
+tokens <- yelp %>% unnest_tokens(word, text)
+tokens
+```
+
+Let's get rid of "stop words", that is, function words, highly frequent adverbials etc.
+
+```{r}
+data("stop_words") # comes with tidytext
+tokens <- anti_join(tokens, stop_words)
+tokens
+```
+
+Let's make word clouds of the five-star reviews...
+
+```{r}
+tokens %>%
+  filter(stars == 5) %>% 
+  count(word, sort = TRUE) %>% 
+  filter(n > 50) %>% 
+  with(wordcloud(word, n, max.words = 100))
+```
+
+... and one of the one-star reviews:
+
+```{r}
+tokens %>%
+  filter(stars == 1) %>% 
+  count(word, sort = TRUE) %>% 
+  filter(n > 50) %>% 
+  with(wordcloud(word, n, max.words = 100))
+```
+
+Let's compute average star ratings per words:
+
+```{r}
+avg_star <- tokens %>% group_by(word) %>% 
+  summarize(stars = mean(stars))
+```
+
+Some of these averages are suspicious because they are exactly 1, 3, 4 or 5 ... which suggests that they are based on perhaps one review. Let's count how frequently each word occurs and merge this to 
+
+```{r}
+avg_star <- tokens %>% count(word) %>%
+  right_join(avg_star) %>% arrange(desc(n))
+```
+
+Let's take only words that occurred at least 10 times (this is a pretty arbitrary threshold, you may want to think of a better one):
+
+```{r}
+avg_star <- avg_star %>% filter(n >= 10)
+nrow(avg_star)
+```
+
+We are left with ~5000 some words.
+
+Let's look at those words that occur in reviews with really high or low average review stars:
+
+```{r}
+arrange(avg_star, stars)
+```
+
+Makes sense — these are all pretty bad word. "visa" is an interesting one...
+
+```{r}
+arrange(avg_star, desc(stars))
+```
+
+Lots of proper names... which suggests that when people like restaurants, they mention the names of particular customers.
+
+Let's see whether these star ratings correlate with emotional valence ratings that were collected in isolation ("norms"), using the data from Warriner et al. (2013):
+
+```{r}
+war <- read_csv('warriner_2013_cleaned.csv')
+avg_star <- left_join(avg_star, war, by = c('word' = 'Word'))
+```
+
+Make a plot of this relationship:
+
+```{r, fig.width = 8, fig.height = 6}
+avg_star %>% ggplot(aes(x = Val, y = stars)) +
+  geom_point() +
+  theme_minimal()
+```
+
+How strong is this correlation?
+
+```{r}
+with(avg_star, cor(Val, stars, use = 'complete.obs'))
+```
+
+r = 0.4 ... I'd say that's pretty decent!
+
+## Average N pos/neg words per review:
+
+For this, let's use a standard sentiment lexicon, the Bing et al. one... this is pretty coarse. It's relatively small and has a categorical scheme (positive / negative). While that may not correspond to your theory of emotional valence (which may be continuous), dealing with words that are treated as EITHER positive OR negative is sometimes useful for presentatinal purporses.
+
+The bing lexicon comes with the sentimentr package that is part of tidytext, and it can be retrieved via the get_sentiments() function:
+
+```{r}
+bing <- get_sentiments('bing')
+```
+
+Join this with the tokens data frame:
+
+```{r}
+bingtokens <- inner_join(tokens, bing)
+bingtokens
+```
+
+Let's compute the number of positive and negative words per review:
+
+```{r}
+pos_per_review <- bingtokens %>%
+  count(review_id, index = sentiment) %>%
+  spread(index, n, fill = 0)
+```
+
+Let's calculate the total number of evaluative words and exclude those for which we have less than 5 words (not much to say there). Let's also compute the proportion of positive words for each review:
+
+```{r}
+pos_per_review <- pos_per_review %>%
+  mutate(sum = negative + positive,
+         prop = positive / sum) %>% 
+  filter(sum >= 5)
+```
+
+Let's get the stars from the main table in there:
+
+```{r}
+pos_per_review <- yelp %>%
+  select(-text) %>%
+  right_join(pos_per_review)
+```
+
+Let's see how well the proportion of positive to negative words predicts the restaurant review ratings:
+
+```{r}
+mymdl <- lm(stars ~ prop, data = pos_per_review)
+glance(mymdl)
+```
+
+An r-squared of 0.44 ... that's pretty high!
+
+What's the correlation coefficient then?
+
+```{r}
+with(pos_per_review, cor(stars, prop))
+```
+
+r = 0.66 ... that's pretty high!
+
+## Using the sentimentr package
+
+Get reviews at the sentence level and perform the sentiment function from the sentimentr package on it. This takes amplifiers and negators into account (see description of algorithm in the sentimentr readme).
+
+Let's check that this works:
+
+```{r}
+sentiment(c('This is good', 'This is not good', 'This is very good', 'This is really good','This is excellent'))
+```
+
+"Not good correctly receives a negative sentiment, and "very good" and "really good" are treated as better than "good". Also, "excellent" is better than "good", which intuitively makes sense.
+
+```{r}
+sentences <- get_sentences(yelp$text)
+mysent <- sentiment(sentences)
+mysent
+```
+
+To compare this to the Yelp reviews stars, we want to average the sentence-level sentiments by review.
+
+```{r}
+myavgs <- mysent %>% group_by(element_id) %>% 
+  summarize(sentiment = mean(sentiment, na.rm = TRUE))
+```
+
+Append this to the main tibble:
+
+```{r}
+yelp <- bind_cols(yelp, myavgs)
+```
+
+See whether they are correlated:
+
+```{r}
+yelp %>% ggplot(aes(x = sentiment, y = stars)) +
+  geom_jitter(alpha = 0.5, width = 0) +
+  theme_minimal()
+```
+
+Use sentiment to predict stars:
+
+```{r}
+with(yelp, cor(sentiment, stars))
+mymdl <- lm(stars ~ sentiment, data = yelp)
+glance(mymdl)
+```
+
+Interestingly, we don't get too much extra leverage out of this sophisticated algorithm. 
+
+
+
+
+
+
